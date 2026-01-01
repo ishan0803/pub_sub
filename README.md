@@ -1,70 +1,128 @@
-# High-Performance Lock-Free Pub-Sub System: Architecture and Performance Analysis
 
-## Abstract
-This project implements a low-latency Publish-Subscribe (Pub-Sub) messaging system designed to minimize thread contention and memory allocation overhead. The core architecture utilizes a hybrid model: a `select()`-based network layer for handling concurrent TCP connections, integrated with a lock-free internal message queue (`moodycamel::ConcurrentQueue`) and a custom slab-based memory pool. This document details the system architecture, experimental methodology, and a quantitative analysis of performance benchmarks conducted with 1,000 concurrent clients.
+# High-Frequency Publish–Subscribe Model
 
-## 1. System Architecture
+A high-performance publish–subscribe messaging system optimized for low-latency, high-throughput message delivery. The implementation prioritizes per-message latency and throughput over feature completeness.
 
-The server is built on C++ (Windows/Winsock) and prioritizes low-latency message dispatching through three key architectural components:
+## Overview
 
-### 1.1 Network I/O Layer
-The network layer utilizes the `select()` system call to multiplex I/O operations across multiple socket descriptors. While `select()` is traditionally O(N), it serves as a baseline concurrency model for managing connection states (Connect, Subscribe, Publish).
-* **Connection Handling:** A single thread manages the `select` loop, accepting incoming connections and routing protocol commands (`SUB`, `PUB`).
-* **Protocol:** A lightweight text-based protocol is used, delimited by newlines, ensuring minimal parsing overhead.
+- Purpose: a minimal, efficient pub-sub server designed for high-frequency trading, telemetry, and real-time event distribution.
+- Core implementation:
+  - `server.cpp` – multi-threaded server with separate IO and worker threads, lock-free queues, and per-topic sharding for minimal lock contention.
+  - `memory_pool.h` – fixed-size, lock-free memory pool that eliminates malloc/free overhead on the critical path.
 
-### 1.2 Lock-Free Internal Messaging
-To decouple network I/O from message broadcasting, the system employs the `moodycamel::ConcurrentQueue`, a multi-producer, multi-consumer lock-free queue.
-* **Topic Queues:** Each topic is assigned a dedicated `ConcurrentQueue<std::string>`, allowing publishers to enqueue messages without acquiring mutex locks.
-* **Worker Threads:** Dedicated worker threads consume from these queues and broadcast messages to subscribers, ensuring that heavy broadcasting logic does not block the main network loop.
+Target environment: Intel i7-12650H (12th Gen), 10 cores / 16 threads, Ubuntu on WSL2, compiled with g++ `-O2 -march=native`.
 
-### 1.3 Zero-Overhead Memory Management
-To prevent heap fragmentation and the latency spikes associated with `new`/`delete` during high-throughput bursts, the system utilizes a custom `MemoryPool`.
-* **Mechanism:** The pool pre-allocates fixed-size blocks (1KB) and manages them using a lock-free queue for rapid allocation and deallocation.
-* **Impact:** This ensures O(1) memory retrieval time for incoming messages.
+## Server Architecture (server.cpp)
 
-## 2. Experimental Methodology
+The server uses a share-nothing, sharded design to minimize contention:
 
-### 2.1 Benchmark Configuration
-The system was stress-tested using a custom C++ benchmarking tool (`benchmark.cpp`) designed to simulate concurrent client behavior.
-* **Environment:** Localhost (Loopback interface).
-* **Concurrency:** 1,000 concurrent persistent TCP connections.
-* **Workload:**
-    * **Phase 1:** Connection Establishment (Mass connect).
-    * **Phase 2:** Subscription (All clients subscribe to a single topic "general").
-    * **Phase 3:** Publish/Ack Cycle (Clients publish messages and wait for echo confirmation).
+- **IO threads** (`NUM_IO_THREADS = 4`): accept connections via `SO_REUSEPORT` and perform non-blocking reads with `epoll` edge-triggered mode.
+- **Worker threads** (`NUM_WORKER_THREADS = 10`): handle topic operations and message delivery. IO threads parse commands and enqueue `Task` objects to lock-free queues via deterministic topic hashing (FNV-1a).
+- **Per-topic sharding**: all operations for a given topic are routed to a single worker, eliminating locks on subscriber sets. Each worker maintains thread-local `localTopics` maps.
+- **Aggressive pruning**: slow or unresponsive subscribers are closed immediately to prevent head-of-line blocking.
 
-### 2.2 Metrics
-* **Throughput:** Defined as the number of messages successfully published and acknowledged per second.
-* **Latency:** The round-trip time (RTT) from publishing a message to receiving the broadcast confirmation.
+Design trade-offs:
 
-## 3. Results and Analysis
+- **Sharding improves throughput** but introduces risk of load imbalance if topic subscription is skewed.
+- **Edge-triggered epoll** reduces syscalls but requires careful non-blocking logic and full drain on EPOLLIN events.
+- **Kernel-level load balancing** via `SO_REUSEPORT` distributes accepts across IO threads without user-space logic.
 
-Three independent trials were conducted with varying loads. The results demonstrate sub-millisecond latency characteristics typical of lock-free architectures.
+## Memory Management (memory_pool.h)
 
-### 3.1 Performance Data
+A lock-free fixed-size memory pool eliminates malloc/free syscall overhead:
 
-| Trial | Clients | Messages Sent | Duration (s) | Throughput (msg/sec) | Avg Latency (ms) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **1** | 1,000 | 100,000 | 4.93 | **20,276** | **0.78 ms** |
-| **2** | 500 | 5,000 | 0.36 | **14,082** | **0.35 ms** |
-| **3** | 1,000 | 10,000 | 0.41 | **24,441** | **0.09 ms** |
+- **Fixed block size** (`BLOCK_SIZE = 4096`) pre-allocated on startup.
+- **Treiber-style free-list** using a single atomic with index + tag (64-bit CAS) for ABA mitigation.
+- **Allocation**: CAS loop pops from free-list; falls back to `operator new` if exhausted.
+- **Deallocation**: CAS loop returns blocks to free-list; external pointers freed normally.
+- **Cache alignment**: `Block` structure uses 64-byte alignment to prevent false sharing across cores.
 
-### 3.2 Latency Analysis
-The system achieved an ultra-low latency floor of **0.089 ms** (Trial 3). This performance is attributed to the `ConcurrentQueue` integration; by removing lock contention on the critical path of message enqueueing, the server processes requests immediately upon receipt. Even under the sustained load of 100,000 messages (Trial 1), latency remained stable at **0.78 ms**, indicating minimal queuing delay.
+Trade-offs:
 
-### 3.3 Throughput Analysis
-The observed throughput peaked at **~24,441 messages/second**. It is important to note that this figure reflects the limits of the *synchronous benchmarking client* rather than the server's saturation point.
-* The benchmark operates on a "Send -> Wait for Reply" cycle.
-* With a latency of ~0.09ms, a single thread is theoretically capped at ~11,000 requests/second.
-* The server successfully handled the aggregate throughput of all client threads without saturating the CPU, as evidenced by the 0.0 failure rate across all trials.
+- Global atomic reduces allocations but adds contention under very high rates (>1M alloc/sec).
+- Fixed block size is simple and fast, but wastes memory for small objects.
 
-## 4. Conclusion
+## Benchmark & Performance
 
-The initial implementation of the Pub-Sub server demonstrates that integrating lock-free data structures with standard `select()` I/O yields high-performance results for moderate concurrency levels (up to 1,000 clients). The system successfully maintains sub-millisecond latency (<1ms) under load.
+A synthetic benchmark client (`benchmark.cpp`) measures end-to-end latency:
 
-For scaling beyond 10,000+ concurrent users, the `select()` O(N) polling mechanism will eventually become a bottleneck. Future iterations will transition the network layer to **I/O Completion Ports (IOCP)** to maintain these latency characteristics at a massive scale.
+- Each client establishes a TCP connection, subscribes to a unique topic, and publishes with a nanosecond timestamp embedded in the payload.
+- On receipt, the client measures RTT as the difference between current time and the embedded timestamp.
+- `TCP_NODELAY` is enabled to prevent Nagle buffering and ensure per-message measurement accuracy.
+- Throughput and latency percentiles (p50, p99) are logged every second.
 
-## 5. References
-1.  **Server Implementation**: `server.cpp` - Core networking logic using `select` and worker threads.
-2.  **Lock-Free Queue**: `concurrentqueue.h` - `moodycamel::ConcurrentQueue` implementation.
-3.  **Memory Management**: `memory_pool.h` - Custom slab allocator.
+## Performance Results
+
+| Clients | Throughput (msg/s) | Avg Latency (µs) | p50 (µs) | p99 (µs) |
+|--------:|-------------------:|-----------------:|---------:|---------:|
+| 10      | 69,422             | 143.9            | 124.8    | 464.9    |
+| 500     | 154,825            | 3,229.4          | 2,972.5  | 6,619.8  |
+| 1000    | 168,339            | 5,939.2          | 5,691.9  | 10,853.5 |
+| 2000    | 124,450            | 16,141.6         | 15,968.5 | 24,403.6 |
+
+**Observations:**
+
+- Peak throughput (~168k msg/s) achieved at 1000 concurrent clients; performance degrades at 2000 clients due to kernel scheduling overhead and per-socket buffer limits.
+- Long p99 tail at high concurrency indicates occasional scheduling delays or slow subscriber drains.
+
+## Limitations
+
+- **No delivery guarantees**: slow or unresponsive clients are pruned; no persistent queue.
+- **No backpressure**: subscribers are dropped rather than applying fine-grained flow control.
+- **Topic-based sharding** can cause load imbalance if subscription patterns are skewed.
+- **Single-machine only**: no clustering, replication, or cross-datacenter support.
+- **Fixed-size memory blocks**: may waste memory for small allocations.
+
+## Future Work
+
+**Data plane optimizations:**
+- Multi-packet batching to reduce syscall overhead.
+- Zero-copy message handling and payload sharing across subscribers.
+- DPDK or kernel bypass for sub-microsecond latency at line rate.
+- User-space packet scheduling and pacing.
+
+**High-frequency enhancements:**
+- Per-worker NUMA-aware memory pools to reduce cross-socket contention.
+- Dynamic topic shard rebalancing for skewed workloads.
+- Fine-grained backpressure with per-subscriber queues and flow control.
+- Persistent log and replay for order guarantees.
+
+## Build & Run Instructions
+
+Prerequisites:
+
+- Linux environment (Ubuntu on WSL2 used for these experiments).
+- g++ with C++17 support.
+- Increase file descriptor limit for large client counts: `ulimit -n 100000`.
+
+Compile server and benchmark:
+
+```bash
+g++ -O2 -std=c++17 -pthread -march=native -o server server.cpp
+g++ -O2 -std=c++17 -pthread -march=native -o bench benchmark.cpp
+```
+
+Run server and benchmark (example):
+
+```bash
+# in one terminal
+./server
+
+# in another terminal: run benchmark with N simulated clients
+./bench 1000
+```
+
+Benchmark options:
+
+- `./bench <num_clients>` — number of concurrent client connections to simulate (default in code is 1000 if omitted).
+
+Notes on running large experiments:
+
+- Ensure `ulimit -n` is large enough for the number of simultaneous sockets you plan to open.
+- On WSL2, system scheduling and virtualization overhead can affect absolute numbers; use results for relative comparisons and system behavior analysis rather than for absolute performance claims.
+
+## Dependencies
+
+- **concurrentqueue.h** (external): Moodycamel's lock-free MPMC queue used for inter-thread task distribution.
+
+---
