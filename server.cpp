@@ -1,12 +1,3 @@
-/*
-    server_sharded.cpp - "Share Nothing" HFT Architecture
-    - Sharded Workers based on Topic Hash
-    - ZERO Locks on the Hot Path (No Mutexes)
-    - True Parallelism: N Workers = N Independent Engines
-    
-    Compile: g++ server_sharded.cpp -o server_sharded -O3 -lpthread
-*/
-
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
@@ -29,11 +20,10 @@
 
 #define PORT 5555
 #define MAX_EVENTS 10000
-#define NUM_IO_THREADS 4      // Adjust to available cores (e.g., 2)
-#define NUM_WORKER_THREADS 10  // Adjust to available cores (e.g., 4)
+#define NUM_IO_THREADS 4      
+#define NUM_WORKER_THREADS 10  
 
-// --- Hashing for Sharding ---
-// FNV-1a Hash (Fast and good distribution for strings)
+// FNV-1a hash used for low-collision, fast distribution of topics to specific worker shards
 inline uint32_t hash_topic(const char* str) {
     uint32_t hash = 2166136261u;
     while (*str) {
@@ -43,7 +33,6 @@ inline uint32_t hash_topic(const char* str) {
     return hash;
 }
 
-// --- Task Definition ---
 enum TaskType { CMD_SUB, CMD_PUB, CMD_DISCONNECT };
 
 struct Task {
@@ -53,40 +42,38 @@ struct Task {
     char payload[1024];
 };
 
+// Fixed-size memory pool to avoid runtime malloc/free syscall overhead and fragmentation
 MemoryPool taskPool(500000); 
 std::atomic<bool> running{true};
 
-// --- Sharded Queues ---
-// Each worker has its OWN queue. IO threads push to specific queues.
+// Lock-free queues minimize contention between IO threads (producers) and Workers (consumers)
 std::vector<moodycamel::ConcurrentQueue<Task*>> workerQueues(NUM_WORKER_THREADS);
 
-// --- Network Utils ---
 void set_nonblocking(int sock) {
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 }
 
+// Disables Nagle's Algorithm to prevent buffering of small packets, ensuring lowest latency
 void set_tcp_nodelay(int sock) {
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 }
 
-// --- WORKER THREAD (Consumer) ---
 void worker_loop(int id) {
-    printf(">> Worker %d: Started (Owns Shard %d)\n", id, id);
+    printf(">> Worker %d: Online | Shard ID: %d\n", id, id);
     
-    // THREAD LOCAL STATE (No Locks Needed!)
+    // Thread-local storage eliminates the need for Mutex/Spinlocks entirely (Share Nothing Architecture)
     std::unordered_map<std::string, std::unordered_set<int>> localTopics;
     
     Task* task;
-    char broadcast_buf[2048]; // Stack buffer
+    char broadcast_buf[2048]; 
 
     while (running) {
-        // Only consume from MY queue
         if (workerQueues[id].try_dequeue(task)) {
             
             if (task->type == CMD_SUB) {
-                // No Mutex! Only I touch this map.
+                // Safe insertion without locks due to sharding
                 localTopics[task->topic].insert(task->client_fd);
                 
                 int len = snprintf(broadcast_buf, sizeof(broadcast_buf), 
@@ -104,7 +91,7 @@ void worker_loop(int id) {
                          int sub_fd = *it;
                          ssize_t sent = send(sub_fd, broadcast_buf, len, MSG_NOSIGNAL);
                          
-                         // Slow Consumer Disconnect
+                         // Aggressively prune slow consumers to prevent head-of-line blocking
                          if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                              close(sub_fd);
                              it = subs.erase(it);
@@ -115,24 +102,20 @@ void worker_loop(int id) {
                 }
             }
             else if (task->type == CMD_DISCONNECT) {
-                // We don't know which topics the client was on, so we scan.
-                // Since this is thread-local, it's fast (cache hot).
+                // Fast cleanup: local cache hit likely high for thread-local map
                 for (auto& pair : localTopics) {
                     pair.second.erase(task->client_fd);
                 }
-                // Note: We do NOT close(fd) here, IO thread or first worker handles it. 
-                // In this architecture, it's safer if IO thread closes FD after broadcasting disconnect.
             }
 
             taskPool.deallocate(task);
         } else {
-            // Spin/Yield hybrid for low latency
+            // Yield to OS scheduler to prevent 100% CPU usage on idle, keeping thermal throttling down
             std::this_thread::yield();
         }
     }
 }
 
-// --- IO THREAD (Producer) ---
 struct ClientBuffer {
     int fd;
     char buffer[4096];
@@ -180,10 +163,9 @@ void process_buffer(ClientBuffer* c) {
                 strcpy(t->topic, t_topic);
                 if(t_type == CMD_PUB) strcpy(t->payload, t_payload);
 
-                // KEY: Hash Topic to find Worker ID
+                // Deterministic routing ensures all events for a topic go to the same worker
                 uint32_t worker_id = hash_topic(t->topic) % NUM_WORKER_THREADS;
                 
-                // Enqueue to SPECIFIC worker
                 workerQueues[worker_id].enqueue(t);
             }
 
@@ -199,11 +181,12 @@ void process_buffer(ClientBuffer* c) {
 }
 
 void io_loop(int id) {
-    printf(">> IO Thread %d: Started\n", id);
+    printf(">> IO Thread %d: Active\n", id);
 
     int s_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1; 
     setsockopt(s_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // SO_REUSEPORT allows kernel-level load balancing across multiple IO threads
     setsockopt(s_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)); 
     set_tcp_nodelay(s_fd);
 
@@ -214,6 +197,7 @@ void io_loop(int id) {
 
     int epfd = epoll_create1(0);
     struct epoll_event ev{}, events[MAX_EVENTS];
+    // Edge-triggered (EPOLLET) mode for maximum throughput with non-blocking IO
     ev.events = EPOLLIN | EPOLLET; ev.data.fd = s_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, s_fd, &ev);
 
@@ -248,8 +232,7 @@ void io_loop(int id) {
                          while (true) {
                             size_t space = 4096 - cb->len;
                             if (space == 0) {
-                                // Buffer Full -> Disconnect
-                                // Broadcast disconnect to ALL workers (since we don't know who owns this client)
+                                // Buffer full disconnect strategy: broadcast disconnect to all workers to ensure cleanup
                                 for(int w=0; w<NUM_WORKER_THREADS; w++) {
                                     Task* t = (Task*)taskPool.allocate();
                                     t->type = CMD_DISCONNECT; t->client_fd = fd;
@@ -267,13 +250,12 @@ void io_loop(int id) {
                                 process_buffer(cb);
                             } else {
                                 if (n == 0 || errno != EAGAIN) {
-                                    // Disconnect broadcast
                                     for(int w=0; w<NUM_WORKER_THREADS; w++) {
                                         Task* t = (Task*)taskPool.allocate();
                                         t->type = CMD_DISCONNECT; t->client_fd = fd;
                                         workerQueues[w].enqueue(t);
                                     }
-                                    close(fd); // IO Thread owns the socket close
+                                    close(fd); 
                                     delete local_clients[fd]; local_clients.erase(fd);
                                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                                 }
@@ -295,12 +277,10 @@ int main() {
     std::vector<std::thread> io_threads;
     std::vector<std::thread> worker_threads;
 
-    // Launch Workers (Consumers)
     for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
         worker_threads.emplace_back(worker_loop, i);
     }
 
-    // Launch IO (Producers)
     for (int i = 0; i < NUM_IO_THREADS; ++i) {
         io_threads.emplace_back(io_loop, i);
     }

@@ -1,12 +1,3 @@
-/*
-    benchmark_telemetry.cpp - Latency & Throughput Analyzer
-    - Embedded Timestamps for RTT
-    - TCP_NODELAY enabled
-    - Percentile Statistics
-    
-    Compile: g++ benchmark_telemetry.cpp -o bench_telemetry -O3
-*/
-
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -25,11 +16,9 @@
 #include <numeric>
 
 #define SERVER_PORT 5555
-// #define SERVER_IP "127.0.0.1" // Change this if running distributed
 #define SERVER_IP "127.0.0.1" 
 #define MAX_EVENTS 10000
 
-// --- Stats ---
 struct Stats {
     std::vector<double> latencies;
     long long total_msgs = 0;
@@ -41,7 +30,7 @@ struct Stats {
     }
 
     void print_and_reset(double elapsed, int active) {
-        if (latencies.empty()) { std::cout << "\rWaiting..." << std::flush; return; }
+        if (latencies.empty()) { std::cout << "\rInitializing..." << std::flush; return; }
         std::sort(latencies.begin(), latencies.end());
         
         double avg = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
@@ -49,7 +38,7 @@ struct Stats {
         double p99 = latencies[latencies.size() * 0.99];
         double throughput = latencies.size() / elapsed;
 
-        printf("\rRate: %7.0f/s | Latency (us): Avg %5.1f | p50 %5.1f | p99 %6.1f | Clients: %d   ",
+        printf("\rTPS: %7.0f | RTT (us): Avg %5.1f | p50 %5.1f | p99 %6.1f | Active Clients: %d   ",
                throughput, avg, p50, p99, active);
         fflush(stdout);
         latencies.clear();
@@ -58,7 +47,6 @@ struct Stats {
 
 Stats global_stats;
 
-// --- Networking ---
 enum State { CONNECTING, SUBSCRIBING, PUBLISHING };
 
 struct Client {
@@ -82,6 +70,7 @@ void set_nonblocking(int sock) {
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 }
 
+// Critical: Disable packet coalescing to measure true per-message latency
 void set_tcp_nodelay(int sock) {
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
@@ -115,7 +104,7 @@ void try_connect(Client* c, int epfd) {
     if (c->fd != -1) { epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, nullptr); close(c->fd); }
     c->fd = socket(AF_INET, SOCK_STREAM, 0);
     set_nonblocking(c->fd);
-    set_tcp_nodelay(c->fd); // Critical
+    set_tcp_nodelay(c->fd); 
     
     connect(c->fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
     c->state = CONNECTING;
@@ -138,6 +127,7 @@ void process_line(Client* c, const std::string& line, int epfd) {
     else if (c->state == PUBLISHING) {
         size_t col = line.find(':');
         if (col != std::string::npos) {
+            // Calculate RTT by comparing current time with embedded timestamp in payload
             try { global_stats.record(std::stoll(line.substr(col + 2)), now_ns()); } catch(...) {}
         }
         queue_data(c, "PUB " + c->my_topic + " " + std::to_string(now_ns()) + "\n", epfd);
@@ -146,7 +136,7 @@ void process_line(Client* c, const std::string& line, int epfd) {
 
 int main(int argc, char* argv[]) {
     int num_clients = (argc > 1) ? atoi(argv[1]) : 1000;
-    std::cout << ">> Telemetry Client (" << num_clients << ")\n";
+    std::cout << ">> Latency Benchmark Tool (" << num_clients << " Clients)\n";
 
     server_addr.sin_family = AF_INET; server_addr.sin_port = htons(SERVER_PORT);
     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);

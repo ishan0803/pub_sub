@@ -6,11 +6,11 @@
 #include <new>
 #include <limits>
 
-// Optimization: 4KB Block Size matches OS Page Size
 constexpr size_t BLOCK_SIZE = 4096; 
 
 class MemoryPool {
 public:
+    // Align to 64 bytes (common cache line size) to prevent False Sharing
     struct Block {
         alignas(64) char data[BLOCK_SIZE];
     };
@@ -30,6 +30,7 @@ private:
     void* pool_start;
     void* pool_end;
 
+    // Packing index and tag into single 64-bit integer allows atomic CAS operations
     static uint64_t pack(TaggedIndex ti) {
         return (static_cast<uint64_t>(ti.index) << 32) | ti.tag;
     }
@@ -39,7 +40,7 @@ private:
     }
 
 public:
-    explicit MemoryPool(size_t poolSize = 50000) { // ~200MB Default
+    explicit MemoryPool(size_t poolSize = 50000) { 
         blocks.resize(poolSize);
         next_indices.resize(poolSize);
         pool_start = blocks.data();
@@ -51,6 +52,7 @@ public:
         head.store(pack({0, 0}));
     }
 
+    // Lock-free allocation via CAS loop
     void* allocate() {
         uint64_t old_val = head.load(std::memory_order_acquire);
         while (true) {
@@ -58,6 +60,7 @@ public:
             if (curr.index == NULL_IDX) return ::operator new(sizeof(Block)); 
             
             uint32_t next = next_indices[curr.index];
+            // Incrementing tag solves the ABA problem in lock-free stacks
             uint64_t new_val = pack({next, curr.tag + 1});
 
             if (head.compare_exchange_weak(old_val, new_val, std::memory_order_acq_rel, std::memory_order_acquire)) {
