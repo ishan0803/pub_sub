@@ -1,9 +1,3 @@
-/*
-    memory_pool.h - High-Performance Lock-Free Allocator
-    - Block Size: 4096 bytes (OS Page Size) for optimal I/O
-    - Thread-Safety: Atomic CAS (Lock-Free)
-    - Fallback: Heap allocation if pool exhausted
-*/
 #pragma once
 #include <vector>
 #include <atomic>
@@ -12,6 +6,7 @@
 #include <new>
 #include <limits>
 
+// Optimization: 4KB Block Size matches OS Page Size
 constexpr size_t BLOCK_SIZE = 4096; 
 
 class MemoryPool {
@@ -44,7 +39,7 @@ private:
     }
 
 public:
-    explicit MemoryPool(size_t poolSize = 50000) { // Default ~200MB
+    explicit MemoryPool(size_t poolSize = 50000) { // ~200MB Default
         blocks.resize(poolSize);
         next_indices.resize(poolSize);
         pool_start = blocks.data();
@@ -60,11 +55,8 @@ public:
         uint64_t old_val = head.load(std::memory_order_acquire);
         while (true) {
             TaggedIndex curr = unpack(old_val);
+            if (curr.index == NULL_IDX) return ::operator new(sizeof(Block)); 
             
-            if (curr.index == NULL_IDX) {
-                return ::operator new(sizeof(Block)); 
-            }
-
             uint32_t next = next_indices[curr.index];
             uint64_t new_val = pack({next, curr.tag + 1});
 
@@ -82,10 +74,7 @@ public:
                 TaggedIndex curr = unpack(old_val);
                 next_indices[idx] = curr.index;
                 uint64_t new_val = pack({idx, curr.tag + 1});
-
-                if (head.compare_exchange_weak(old_val, new_val, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    return;
-                }
+                if (head.compare_exchange_weak(old_val, new_val, std::memory_order_acq_rel, std::memory_order_acquire)) return;
             }
         } else {
             ::operator delete(ptr);

@@ -1,16 +1,17 @@
 /*
-    server.cpp - Professional Grade Epoll Server
-    - TRUE Zero-Copy/Zero-Malloc Buffering (Pool-based Output Chain)
-    - O(1) Disconnect Handling (Reverse Index)
-    - Robust EPOLLOUT Handling (No Data Loss)
+    server_sharded.cpp - "Share Nothing" HFT Architecture
+    - Sharded Workers based on Topic Hash
+    - ZERO Locks on the Hot Path (No Mutexes)
+    - True Parallelism: N Workers = N Independent Engines
     
-    Compile: g++ server.cpp -o server -O3
+    Compile: g++ server_sharded.cpp -o server_sharded -O3 -lpthread
 */
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -18,193 +19,271 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
+#include <thread>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
-#include <algorithm>
-#include "memory_pool.h" 
 
-#include <netinet/tcp.h> // <--- ADD THIS HEADER
+#include "concurrentqueue.h"
+#include "memory_pool.h"
+
+#define PORT 5555
+#define MAX_EVENTS 10000
+#define NUM_IO_THREADS 4      // Adjust to available cores (e.g., 2)
+#define NUM_WORKER_THREADS 10  // Adjust to available cores (e.g., 4)
+
+// --- Hashing for Sharding ---
+// FNV-1a Hash (Fast and good distribution for strings)
+inline uint32_t hash_topic(const char* str) {
+    uint32_t hash = 2166136261u;
+    while (*str) {
+        hash ^= (uint8_t)(*str++);
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+// --- Task Definition ---
+enum TaskType { CMD_SUB, CMD_PUB, CMD_DISCONNECT };
+
+struct Task {
+    TaskType type;
+    int client_fd;
+    char topic[64];
+    char payload[1024];
+};
+
+MemoryPool taskPool(500000); 
+std::atomic<bool> running{true};
+
+// --- Sharded Queues ---
+// Each worker has its OWN queue. IO threads push to specific queues.
+std::vector<moodycamel::ConcurrentQueue<Task*>> workerQueues(NUM_WORKER_THREADS);
+
+// --- Network Utils ---
+void set_nonblocking(int sock) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+}
 
 void set_tcp_nodelay(int sock) {
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 }
 
-#define PORT 5555
-#define MAX_EVENTS 20000
+// --- WORKER THREAD (Consumer) ---
+void worker_loop(int id) {
+    printf(">> Worker %d: Started (Owns Shard %d)\n", id, id);
+    
+    // THREAD LOCAL STATE (No Locks Needed!)
+    std::unordered_map<std::string, std::unordered_set<int>> localTopics;
+    
+    Task* task;
+    char broadcast_buf[2048]; // Stack buffer
 
-// --- Output Buffer Node ---
-struct OutputBlock {
-    size_t len = 0;
-    size_t offset = 0;
-    OutputBlock* next = nullptr;
-    char data[BLOCK_SIZE - sizeof(size_t)*2 - sizeof(OutputBlock*)]; 
-};
-
-// --- Client Structure ---
-struct Client {
-    int fd;
-    char input_buf[4096];
-    size_t input_len = 0;
-
-    OutputBlock* out_head = nullptr;
-    OutputBlock* out_tail = nullptr;
-    bool watching_write = false;
-
-    std::unordered_set<std::string> subscriptions; 
-};
-
-// --- Globals ---
-MemoryPool blockPool(100000); 
-int epfd;
-std::unordered_map<int, Client*> clients; 
-std::unordered_map<std::string, std::vector<int>> topics;
-
-void set_nonblocking(int sock) {
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-}
-
-void mod_epoll(int fd, uint32_t events) {
-    struct epoll_event ev;
-    ev.events = events;
-    ev.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-}
-
-// --- OUTPUT ENGINE ---
-void queue_output(Client* c, const char* data, size_t len) {
-    size_t remaining = len;
-    size_t data_off = 0;
-
-    while (remaining > 0) {
-        if (!c->out_tail || c->out_tail->len == sizeof(c->out_tail->data)) {
-            void* mem = blockPool.allocate();
-            OutputBlock* b = new(mem) OutputBlock(); 
+    while (running) {
+        // Only consume from MY queue
+        if (workerQueues[id].try_dequeue(task)) {
             
-            if (c->out_tail) c->out_tail->next = b;
-            else c->out_head = b;
-            c->out_tail = b;
-        }
-
-        size_t space = sizeof(c->out_tail->data) - c->out_tail->len;
-        size_t take = std::min(space, remaining);
-        
-        memcpy(c->out_tail->data + c->out_tail->len, data + data_off, take);
-        c->out_tail->len += take;
-        remaining -= take;
-        data_off += take;
-    }
-
-    if (!c->watching_write) {
-        mod_epoll(c->fd, EPOLLIN | EPOLLOUT | EPOLLET);
-        c->watching_write = true;
-    }
-}
-
-void flush_output(Client* c) {
-    while (c->out_head) {
-        OutputBlock* b = c->out_head;
-        size_t to_write = b->len - b->offset;
-        
-        ssize_t sent = send(c->fd, b->data + b->offset, to_write, MSG_NOSIGNAL);
-        
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break; 
-            return; 
-        }
-
-        b->offset += sent;
-        
-        if (b->offset == b->len) {
-            c->out_head = b->next;
-            if (!c->out_head) c->out_tail = nullptr;
-            blockPool.deallocate(b);
-        } else {
-            break; 
-        }
-    }
-
-    if (!c->out_head && c->watching_write) {
-        mod_epoll(c->fd, EPOLLIN | EPOLLET);
-        c->watching_write = false;
-    }
-}
-
-// --- CLIENT LOGIC ---
-void remove_client(int fd) {
-    if (clients.count(fd)) {
-        Client* c = clients[fd];
-        
-        for (const std::string& topic : c->subscriptions) {
-            auto& list = topics[topic];
-            for (size_t i = 0; i < list.size(); ++i) {
-                if (list[i] == fd) {
-                    list[i] = list.back();
-                    list.pop_back();
-                    break;
+            if (task->type == CMD_SUB) {
+                // No Mutex! Only I touch this map.
+                localTopics[task->topic].insert(task->client_fd);
+                
+                int len = snprintf(broadcast_buf, sizeof(broadcast_buf), 
+                                   "Subscribed to %s\n", task->topic);
+                send(task->client_fd, broadcast_buf, len, MSG_NOSIGNAL);
+            }
+            else if (task->type == CMD_PUB) {
+                if (localTopics.count(task->topic)) {
+                    int len = snprintf(broadcast_buf, sizeof(broadcast_buf), 
+                                       "Message on %s: %s\n", task->topic, task->payload);
+                    
+                    auto& subs = localTopics[task->topic];
+                    
+                    for (auto it = subs.begin(); it != subs.end(); ) {
+                         int sub_fd = *it;
+                         ssize_t sent = send(sub_fd, broadcast_buf, len, MSG_NOSIGNAL);
+                         
+                         // Slow Consumer Disconnect
+                         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                             close(sub_fd);
+                             it = subs.erase(it);
+                         } else {
+                             ++it;
+                         }
+                    }
                 }
             }
+            else if (task->type == CMD_DISCONNECT) {
+                // We don't know which topics the client was on, so we scan.
+                // Since this is thread-local, it's fast (cache hot).
+                for (auto& pair : localTopics) {
+                    pair.second.erase(task->client_fd);
+                }
+                // Note: We do NOT close(fd) here, IO thread or first worker handles it. 
+                // In this architecture, it's safer if IO thread closes FD after broadcasting disconnect.
+            }
+
+            taskPool.deallocate(task);
+        } else {
+            // Spin/Yield hybrid for low latency
+            std::this_thread::yield();
         }
-        
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-        close(fd);
-        
-        OutputBlock* curr = c->out_head;
-        while (curr) {
-            OutputBlock* next = curr->next;
-            blockPool.deallocate(curr);
-            curr = next;
-        }
-        
-        delete c; 
-        clients.erase(fd);
     }
 }
 
-void process_data(Client* c) {
-    char* buf = c->input_buf;
+// --- IO THREAD (Producer) ---
+struct ClientBuffer {
+    int fd;
+    char buffer[4096];
+    size_t len = 0;
+};
+
+void process_buffer(ClientBuffer* c) {
+    char* buf = c->buffer;
     size_t processed = 0;
 
-    for (size_t i = 0; i < c->input_len; ++i) {
+    for (size_t i = 0; i < c->len; ++i) {
         if (buf[i] == '\n') {
             buf[i] = '\0';
             char* line = buf + processed;
             if (i > 0 && buf[i-1] == '\r') buf[i-1] = '\0';
 
+            bool valid = false;
+            TaskType t_type;
+            char t_topic[64] = {0};
+            char t_payload[1024] = {0};
+
             if (strncmp(line, "SUB", 3) == 0) {
                 char* sp = strchr(line + 4, ' ');
                 if (sp) {
-                    char* topic = sp + 1;
-                    topics[topic].push_back(c->fd);
-                    c->subscriptions.insert(topic);
-                    std::string ack = "Subscribed to " + std::string(topic) + "\n";
-                    queue_output(c, ack.c_str(), ack.length());
+                    t_type = CMD_SUB;
+                    strncpy(t_topic, sp + 1, 63);
+                    valid = true;
                 }
             }
             else if (strncmp(line, "PUB", 3) == 0) {
                 char* sp = strchr(line + 4, ' ');
                 if (sp) {
                     *sp = '\0';
-                    char* topic = line + 4;
-                    char* msg = sp + 1;
-                    
-                    if (topics.count(topic)) {
-                        std::string full = "Message on " + std::string(topic) + ": " + std::string(msg) + "\n";
-                        for (int sub_fd : topics[topic]) {
-                            queue_output(clients[sub_fd], full.c_str(), full.length());
-                        }
-                    }
+                    t_type = CMD_PUB;
+                    strncpy(t_topic, line + 4, 63);
+                    strncpy(t_payload, sp + 1, 1023);
+                    valid = true;
                 }
             }
+
+            if (valid) {
+                Task* t = (Task*)taskPool.allocate();
+                t->type = t_type;
+                t->client_fd = c->fd;
+                strcpy(t->topic, t_topic);
+                if(t_type == CMD_PUB) strcpy(t->payload, t_payload);
+
+                // KEY: Hash Topic to find Worker ID
+                uint32_t worker_id = hash_topic(t->topic) % NUM_WORKER_THREADS;
+                
+                // Enqueue to SPECIFIC worker
+                workerQueues[worker_id].enqueue(t);
+            }
+
             processed = i + 1;
         }
     }
 
     if (processed > 0) {
-        size_t remain = c->input_len - processed;
-        if (remain > 0) memmove(c->input_buf, c->input_buf + processed, remain);
-        c->input_len = remain;
+        size_t rem = c->len - processed;
+        if (rem > 0) memmove(c->buffer, c->buffer + processed, rem);
+        c->len = rem;
+    }
+}
+
+void io_loop(int id) {
+    printf(">> IO Thread %d: Started\n", id);
+
+    int s_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1; 
+    setsockopt(s_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(s_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)); 
+    set_tcp_nodelay(s_fd);
+
+    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(PORT);
+    bind(s_fd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(s_fd, SOMAXCONN);
+    set_nonblocking(s_fd);
+
+    int epfd = epoll_create1(0);
+    struct epoll_event ev{}, events[MAX_EVENTS];
+    ev.events = EPOLLIN | EPOLLET; ev.data.fd = s_fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, s_fd, &ev);
+
+    std::unordered_map<int, ClientBuffer*> local_clients;
+
+    while (running) {
+        int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
+
+        for (int i = 0; i < nfds; ++i) {
+            int fd = events[i].data.fd;
+
+            if (fd == s_fd) {
+                while (true) {
+                    int cfd = accept(s_fd, nullptr, nullptr);
+                    if (cfd < 0) break;
+                    set_nonblocking(cfd);
+                    set_tcp_nodelay(cfd);
+                    
+                    ClientBuffer* cb = new ClientBuffer();
+                    cb->fd = cfd;
+                    local_clients[cfd] = cb;
+
+                    ev.events = EPOLLIN | EPOLLET; ev.data.fd = cfd;
+                    epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev);
+                    
+                    send(cfd, "OK\n", 3, MSG_NOSIGNAL);
+                }
+            } else {
+                if (events[i].events & EPOLLIN) {
+                    if (local_clients.count(fd)) {
+                         ClientBuffer* cb = local_clients[fd];
+                         while (true) {
+                            size_t space = 4096 - cb->len;
+                            if (space == 0) {
+                                // Buffer Full -> Disconnect
+                                // Broadcast disconnect to ALL workers (since we don't know who owns this client)
+                                for(int w=0; w<NUM_WORKER_THREADS; w++) {
+                                    Task* t = (Task*)taskPool.allocate();
+                                    t->type = CMD_DISCONNECT; t->client_fd = fd;
+                                    workerQueues[w].enqueue(t);
+                                }
+                                close(fd);
+                                delete local_clients[fd]; local_clients.erase(fd);
+                                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                                break;
+                            }
+
+                            ssize_t n = recv(fd, cb->buffer + cb->len, space, 0);
+                            if (n > 0) {
+                                cb->len += n;
+                                process_buffer(cb);
+                            } else {
+                                if (n == 0 || errno != EAGAIN) {
+                                    // Disconnect broadcast
+                                    for(int w=0; w<NUM_WORKER_THREADS; w++) {
+                                        Task* t = (Task*)taskPool.allocate();
+                                        t->type = CMD_DISCONNECT; t->client_fd = fd;
+                                        workerQueues[w].enqueue(t);
+                                    }
+                                    close(fd); // IO Thread owns the socket close
+                                    delete local_clients[fd]; local_clients.erase(fd);
+                                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                                }
+                                break;
+                            }
+                         }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -213,65 +292,21 @@ int main() {
     struct rlimit l; getrlimit(RLIMIT_NOFILE, &l);
     l.rlim_cur = l.rlim_max; setrlimit(RLIMIT_NOFILE, &l);
 
-    int s_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1; setsockopt(s_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(PORT);
-    bind(s_fd, (struct sockaddr*)&addr, sizeof(addr));
-    listen(s_fd, SOMAXCONN);
-    set_nonblocking(s_fd);
+    std::vector<std::thread> io_threads;
+    std::vector<std::thread> worker_threads;
 
-    epfd = epoll_create1(0);
-    struct epoll_event ev{}, events[MAX_EVENTS];
-    ev.events = EPOLLIN | EPOLLET; ev.data.fd = s_fd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, s_fd, &ev);
-
-    std::cout << ">> Server Running (Block Size: " << BLOCK_SIZE << ")\n";
-
-    while (true) {
-        int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
-        for (int i = 0; i < nfds; ++i) {
-            int fd = events[i].data.fd;
-
-            if (fd == s_fd) {
-                while(true) {
-                    int cfd = accept(s_fd, nullptr, nullptr);
-                    if (cfd < 0) break;
-                    set_nonblocking(cfd);
-                    set_tcp_nodelay(cfd);
-                    Client* c = new Client(); 
-                    c->fd = cfd;
-                    clients[cfd] = c;
-
-                    ev.events = EPOLLIN | EPOLLET; ev.data.fd = cfd;
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev);
-                    
-                    queue_output(c, "OK\n", 3);
-                    flush_output(c);
-                }
-            } else {
-                Client* c = clients[fd];
-                uint32_t e = events[i].events;
-
-                if (e & (EPOLLERR | EPOLLHUP)) {
-                    remove_client(fd);
-                    continue;
-                }
-                if (e & EPOLLIN) {
-                    while (true) {
-                        size_t space = 4096 - c->input_len;
-                        if (space == 0) break; 
-                        ssize_t n = recv(fd, c->input_buf + c->input_len, space, 0);
-                        if (n > 0) {
-                            c->input_len += n;
-                            process_data(c);
-                        } else {
-                            if (n == 0 || (errno != EAGAIN)) remove_client(fd);
-                            break;
-                        }
-                    }
-                }
-                if (e & EPOLLOUT) flush_output(c);
-            }
-        }
+    // Launch Workers (Consumers)
+    for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
+        worker_threads.emplace_back(worker_loop, i);
     }
+
+    // Launch IO (Producers)
+    for (int i = 0; i < NUM_IO_THREADS; ++i) {
+        io_threads.emplace_back(io_loop, i);
+    }
+
+    for (auto& t : io_threads) t.join();
+    for (auto& t : worker_threads) t.join();
+
+    return 0;
 }
